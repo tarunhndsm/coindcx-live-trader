@@ -116,13 +116,15 @@ Apps Script (bound to the Sheet)            GitHub Actions (this repo)          
 ## Maintenance
 
 - **Tests:** `node --test --test-reporter=tap test/trader.test.mjs test/bridge.test.mjs`.
-- **Changing `src/Code.gs`.** Paste it into the Apps Script editor and save; the 15-minute trigger
-  runs the saved code.
-  - If the change affects the web app (`doPost`, the state format, the Sheet or the emails), also bump
-    `CODE_VERSION`.
-  - Then choose Deploy > Manage deployments > Edit > Version: New version > Deploy. The URL stays the same.
-  - Push to `main` at the same time. A runner whose `CODE_VERSION` differs from the web app's stops
-    before it calls CoinDCX.
+- **Changing `src/Code.gs`.** The 15-minute trigger was made by the web app, and it does not pick up
+  code that is merely saved in the editor. So every change goes through a new version:
+  1. Bump `CODE_VERSION` if the change affects the web app: `doPost`, the state format, the Sheet or
+     the emails.
+  2. Paste the file into the Apps Script editor and save.
+  3. Choose Deploy > Manage deployments > Edit > Version: New version > Deploy. The URL stays the same.
+  4. Push to `main` straight away. A runner whose `CODE_VERSION` differs from the web app's stops
+     before it calls CoinDCX.
+  5. Run `node tools/admin.mjs install`, which makes the trigger again from the new version.
 - **`tools/admin.mjs`.** This is the owner tool for the web app: `status`, `install`,
   `config GITHUB_TOKEN|OWNER_EMAIL` (the value comes from stdin), `pair <url>` and `secret <name>`.
   It reads the web app URL and secret from `~/.config/coindcx-live-trader/webapp.json`. Running the
