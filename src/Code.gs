@@ -1,10 +1,13 @@
 /**
- * CoinDCX trader for one INR spot wallet, run by Apps Script from its Google Sheet.
+ * CoinDCX trader for one INR spot wallet, controlled from its Google Sheet.
  *
- * Every 15 minutes runTrader() checks prices, the loss brake and any unfinished order. Once an hour it
+ * Every 15 minutes a run checks prices, the loss brake and any unfinished order. Once an hour it
  * replays four slow trend rules, each in its own ₹5,000 paper "sleeve". The real wallet holds the
  * weighted blend of the sleeves' coins. Each Monday the weights move towards the sleeves that did better,
  * within 10% to 40% each. Spot BTC, ETH, SOL and XRP against INR only: no leverage, futures or margin.
+ *
+ * CoinDCX's firewall refuses Google's servers, so the runs execute this same file on GitHub Actions
+ * (runner/run.mjs). Apps Script is the clock, holds the state and keys, and writes the Sheet and the emails.
  *
  * The rules lost a little after costs in testing (see README.md). Nothing here can promise a profit.
  * The brake sells everything and stops if the wallet falls to 80% of its start or of its peak.
@@ -12,9 +15,16 @@
  * @OnlyCurrentDoc
  */
 
+var CODE_VERSION = '2026-10-17.1';
+
 var CONFIG = {
   capitalInr: 5000,
-  email: 't.a.bhagat@gmail.com',
+  repo: 'tarunhndsm/coindcx-live-trader',
+  workflow: 'trade.yml',
+  leaseMs: 9 * 60000,
+  minGapMs: 10 * 60000,
+  staleMs: 50 * 60000,
+  maxSkewMs: 5 * 60000,
   pairs: ['I-BTC_INR', 'I-ETH_INR', 'I-SOL_INR', 'I-XRP_INR'],
   markets: {
     'I-BTC_INR': {symbol: 'BTCINR', coin: 'BTC', step: 1e-5, minQty: 1e-5, qtyDecimals: 5, priceDecimals: 1, halfSpread: 0.0025},
@@ -78,16 +88,25 @@ class ApiError extends Error {
 
 // ---------------------------------------------------------------- entry points
 
-/** Run this once from the editor: it installs the 15-minute schedule, builds the tabs and does a first run. */
+/** Run this once from the editor: it installs the 15-minute schedule, builds the tabs and starts a first run. */
 function setup() {
   ScriptApp.getProjectTriggers().forEach(function (trigger) {
-    if (trigger.getHandlerFunction() === 'runTrader') ScriptApp.deleteTrigger(trigger);
+    if (['runTrader', 'tick'].indexOf(trigger.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(trigger);
   });
-  ScriptApp.newTrigger('runTrader').timeBased().everyMinutes(15).create();
+  ScriptApp.newTrigger('tick').timeBased().everyMinutes(15).create();
   prepareSheets();
-  runTrader();
+  PropertiesService.getScriptProperties().setProperty('INSTALLED_AT', String(nowMs()));
+  tick();
 }
 
+/** Every 15 minutes: starts a run on GitHub Actions, and warns if runs have stopped finishing. */
+function tick() {
+  var props = PropertiesService.getScriptProperties(), now = nowMs(), lease = readLease(props);
+  if (!lease || lease.until <= now) dispatchRun(props, false);
+  watchdog(props, now);
+}
+
+/** Runs a step inside Apps Script itself, which CoinDCX's firewall currently refuses; the schedule uses tick(). */
 function runTrader() {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) return;
@@ -106,11 +125,17 @@ function reportCrash(e) {
     var props = PropertiesService.getScriptProperties(), last = Number(props.getProperty('CRASH_MAIL_AT') || 0);
     if (nowMs() - last < CONFIG.alertEveryMs) return;
     props.setProperty('CRASH_MAIL_AT', String(nowMs()));
-    MailApp.sendEmail(CONFIG.email, 'CoinDCX trader: a run failed',
-                      'The bot hit an error and tries again in 15 minutes.\n\n' + (e && e.stack || e) + '\n\n' + sheetUrl());
+    mailOwner('CoinDCX trader: a run failed',
+              'The bot hit an error and tries again in 15 minutes.\n\n' + (e && e.stack || e) + '\n\n' + sheetUrl());
   } catch (ignored) {
     console.log('Could not email the crash report: ' + ignored);
   }
+}
+
+function mailOwner(subject, body) {
+  var to = PropertiesService.getScriptProperties().getProperty('OWNER_EMAIL');
+  if (!to) throw new Error('No OWNER_EMAIL script property, so "' + subject + '" was not sent.');
+  MailApp.sendEmail(to, subject, body);
 }
 
 function nowMs() { return Date.now(); }
@@ -135,19 +160,16 @@ function menuSetKey() {
   var secret = ui.prompt('CoinDCX API secret', 'Paste the secret shown with that key.', ui.ButtonSet.OK_CANCEL);
   if (secret.getSelectedButton() !== ui.Button.OK) return;
   var keys = {key: key.getResponseText().trim(), secret: secret.getResponseText().trim()};
-  var balances;
-  try {
-    balances = fetchBalances(keys);
-  } catch (e) {
-    ui.alert('CoinDCX did not accept this key, so nothing was saved.\n\n' + e.message);
+  if (keys.key.length < 16 || keys.secret.length < 16 || /\s/.test(keys.key + keys.secret)) {
+    ui.alert('That does not look like a CoinDCX API key and secret, so nothing was saved.');
     return;
   }
   var props = PropertiesService.getScriptProperties();
-  props.setProperty('COINDCX_API_KEY', keys.key);
-  props.setProperty('COINDCX_API_SECRET', keys.secret);
-  var inr = balances.INR ? balances.INR.free : 0;
-  ui.alert('Key saved. CoinDCX shows ' + rupees(inr) + ' of free INR.\n\nWith Mode set to LIVE, the next run (within 15 minutes) ' +
-           'starts trading up to ' + rupees(CONFIG.capitalInr) + ' of it. Choose "Run now" to start at once.');
+  props.setProperties({COINDCX_API_KEY: keys.key, COINDCX_API_SECRET: keys.secret});
+  var started = dispatchRun(props, true);
+  ui.alert('Key saved. ' + (started ? 'A run has started; in about a minute' : 'Within 15 minutes') + ' it checks the key with CoinDCX. ' +
+           'With Mode set to LIVE and at least ' + rupees(CONFIG.minStartInr) + ' of free INR it starts trading up to ' +
+           rupees(CONFIG.capitalInr) + '. If CoinDCX rejects the key, the Control tab shows "API key problem" and you get an email.');
 }
 
 function menuRemoveKey() {
@@ -158,8 +180,9 @@ function menuRemoveKey() {
 }
 
 function menuRunNow() {
-  runTrader();
-  SpreadsheetApp.getUi().alert('Done. The Control tab shows the result.');
+  var props = PropertiesService.getScriptProperties();
+  SpreadsheetApp.getUi().alert(dispatchRun(props, true) ? 'A run has started on GitHub. The Control tab updates in about a minute.'
+                                                        : 'GitHub did not start a run: ' + props.getProperty('DISPATCH_ERROR'));
 }
 
 function menuReport() {
@@ -169,8 +192,8 @@ function menuReport() {
     SpreadsheetApp.getUi().alert('No runs yet. Choose "Run now" first.');
     return;
   }
-  MailApp.sendEmail(CONFIG.email, 'CoinDCX trader report', reportText(state, state.lastTicker || {}, nowMs()));
-  SpreadsheetApp.getUi().alert('Report sent to ' + CONFIG.email + '.');
+  mailOwner('CoinDCX trader report', reportText(state, state.lastTicker || {}, nowMs()));
+  SpreadsheetApp.getUi().alert('Report sent to ' + props.getProperty('OWNER_EMAIL') + '.');
 }
 
 /** Reports whether this server can reach each CoinDCX host. A dummy-key private call should get a JSON 401. */
@@ -199,6 +222,207 @@ function checkConnection() {
   var result = lines.join('\n');
   console.log(result);
   return result;
+}
+
+// ---------------------------------------------------------------- GitHub runs
+//
+// The runner (runner/run.mjs) gets in only through doPost: signed requests to begin a run, save its state before
+// every order, and finish. A lease keeps a second runner from acting on the same wallet at the same time.
+
+function dispatchRun(props, force) {
+  var token = props.getProperty('GITHUB_TOKEN'), problem;
+  if (!token) {
+    problem = 'no GITHUB_TOKEN script property';
+  } else {
+    try {
+      var response = UrlFetchApp.fetch('https://api.github.com/repos/' + CONFIG.repo + '/actions/workflows/' + CONFIG.workflow + '/dispatches', {
+        method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+        headers: {Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'},
+        payload: JSON.stringify({ref: 'main', inputs: {force: force ? 'true' : 'false'}})
+      });
+      if (response.getResponseCode() === 204) {
+        if (props.getProperty('DISPATCH_ERROR')) props.deleteProperty('DISPATCH_ERROR');
+        return true;
+      }
+      problem = 'GitHub answered HTTP ' + response.getResponseCode() + ' ' + response.getContentText().slice(0, 150);
+    } catch (e) {
+      problem = String(e && e.message || e).slice(0, 200);
+    }
+  }
+  props.setProperty('DISPATCH_ERROR', ist(nowMs()) + ': ' + problem);
+  return false;
+}
+
+function watchdog(props, now) {
+  var last = Number(props.getProperty('LAST_OK_AT') || 0), problem = props.getProperty('DISPATCH_ERROR');
+  var quiet = now - Math.max(last, Number(props.getProperty('INSTALLED_AT') || 0));
+  var text = (last ? 'last run finished ' + ist(last) : 'no run has finished yet') + (problem ? '; starting a run failed at ' + problem : '');
+  setHealth(quiet < CONFIG.staleMs ? 'OK, ' + text : 'PROBLEM: ' + text);
+  if (quiet < CONFIG.staleMs || now - Number(props.getProperty('WATCHDOG_MAIL_AT') || 0) < CONFIG.alertEveryMs) return;
+  props.setProperty('WATCHDOG_MAIL_AT', String(now));
+  mailOwner('CoinDCX trader: no run has finished for ' + Math.round(quiet / 60000) + ' minutes',
+            'The bot runs on GitHub Actions every 15 minutes. Until a run finishes it neither trades nor watches its loss brake.\n\n' +
+            text + '.\n\nRuns: https://github.com/' + CONFIG.repo + '/actions\n' + sheetUrl());
+}
+
+function setHealth(text) {
+  try {
+    new Dashboard().sheet('Control').getRange('A5:B5').setValues([['Health', text]]);
+  } catch (e) {
+    console.log('Could not write the health line: ' + e);
+  }
+}
+
+function readLease(props) {
+  try {
+    return JSON.parse(props.getProperty('RUN_LEASE') || 'null');
+  } catch (e) {
+    return null;
+  }
+}
+
+function isStateKey(key) { return /^STATE_(\d+|PARTS)$/.test(key); }
+
+function sameText(a, b) {
+  if (a.length !== b.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** The web app the runner calls. Every request except the one-time "pair" must be signed with WEBAPP_SECRET. */
+function doPost(e) {
+  var reply;
+  try {
+    reply = handleBridge(JSON.parse(e && e.postData && e.postData.contents || '{}'), nowMs());
+  } catch (err) {
+    reply = {ok: false, error: String(err && err.message || err).slice(0, 300)};
+  }
+  return ContentService.createTextOutput(JSON.stringify(reply)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function handleBridge(req, now) {
+  var props = PropertiesService.getScriptProperties(), lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return {ok: false, error: 'busy'};
+  try {
+    if (req.op === 'pair') return bridgePair(props, req);
+    var secret = props.getProperty('WEBAPP_SECRET'), data = typeof req.data === 'string' ? req.data : '';
+    if (!secret) return {ok: false, error: 'not paired yet'};
+    if (!(Math.abs(now - Number(req.ts)) <= CONFIG.maxSkewMs)) return {ok: false, error: 'request too old, or the clocks disagree'};
+    if (!/^[0-9a-f]{32}$/.test(String(req.nonce))) return {ok: false, error: 'bad nonce'};
+    if (!sameText(String(req.sig), hmacHex(req.op + '\n' + req.ts + '\n' + req.nonce + '\n' + data, secret))) {
+      return {ok: false, error: 'bad signature'};
+    }
+    var cache = CacheService.getScriptCache();
+    if (cache.get('nonce-' + req.nonce)) return {ok: false, error: 'replayed request'};
+    cache.put('nonce-' + req.nonce, '1', 900);
+    var body = JSON.parse(data || '{}');
+    if (req.op === 'begin') return bridgeBegin(props, body, now);
+    if (req.op === 'save') return bridgeSave(props, body);
+    if (req.op === 'finish') return bridgeFinish(props, body, now);
+    if (req.op === 'crash') return bridgeCrash(props, body, now);
+    if (req.op === 'config') return bridgeConfig(props, body);
+    if (req.op === 'status') return bridgeStatus(props, now);
+    if (req.op === 'install') {
+      setup();
+      return {ok: true};
+    }
+    return {ok: false, error: 'unknown op'};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function bridgePair(props, req) {
+  if (props.getProperty('WEBAPP_SECRET')) return {ok: false, error: 'already paired'};
+  if (!/^[0-9a-f]{64}$/.test(String(req.secret))) return {ok: false, error: 'the secret must be 64 hex characters'};
+  props.setProperty('WEBAPP_SECRET', req.secret);
+  return {ok: true};
+}
+
+function bridgeBegin(props, body, now) {
+  if (body.version !== CODE_VERSION) {
+    return {ok: false, error: 'Apps Script has version ' + CODE_VERSION + ' and GitHub has ' + body.version + '; deploy the same Code.gs to both.'};
+  }
+  var last = Number(props.getProperty('LAST_OK_AT') || 0), lease = readLease(props);
+  if (!body.force && now - last < CONFIG.minGapMs) return {ok: true, skip: 'a run finished at ' + ist(last)};
+  if (lease && lease.until > now && lease.id !== String(body.runId)) return {ok: true, skip: 'run ' + lease.id + ' is still going'};
+  props.setProperty('RUN_LEASE', JSON.stringify({id: String(body.runId), until: now + CONFIG.leaseMs}));
+  var all = props.getProperties(), state = {};
+  Object.keys(all).forEach(function (key) { if (isStateKey(key)) state[key] = all[key]; });
+  var control = new Dashboard().ss.getSheetByName('Control');
+  return {ok: true, props: state, keys: readKeys(props), modeCell: control ? String(control.getRange('B3').getValue()) : ''};
+}
+
+function holdsLease(props, body) {
+  var lease = readLease(props);
+  return !!lease && lease.id === String(body.runId);
+}
+
+function bridgeSave(props, body) {
+  var values = body.values || {}, keys = Object.keys(values);
+  if (!holdsLease(props, body)) return {ok: false, error: 'this run no longer holds the lease'};
+  if (!keys.length || !keys.every(isStateKey)) return {ok: false, error: 'only STATE_ properties can be saved'};
+  props.setProperties(values);
+  return {ok: true};
+}
+
+function bridgeFinish(props, body, now) {
+  if (props.getProperty('LAST_RUN_ID') === String(body.runId)) return {ok: true, repeated: true};
+  if (!holdsLease(props, body)) return {ok: false, error: 'this run no longer holds the lease'};
+  var state = loadState(props), r = body.run || {};
+  if (!state) return {ok: false, error: 'no saved state'};
+  var run = {now: Number(r.now), props: props, state: state, events: r.events || [], trades: r.trades || [],
+             keys: r.hasKeys ? {} : null, mode: r.mode, newMode: r.newMode || null, ticker: r.ticker || null,
+             errorThisRun: !!r.errorThisRun, waiting: r.waiting || null, keyProblem: r.keyProblem || null};
+  try {
+    new Dashboard().update(run);
+  } catch (e) {
+    console.log('Sheet update failed: ' + (e && e.stack || e));
+  }
+  try {
+    sendMail(run);
+  } catch (e) {
+    console.log('Email failed: ' + (e && e.message || e));
+  }
+  saveState(props, state);
+  props.setProperties({LAST_OK_AT: String(now), LAST_RUN_ID: String(body.runId)});
+  props.deleteProperty('RUN_LEASE');
+  watchdog(props, now);
+  return {ok: true};
+}
+
+function bridgeCrash(props, body, now) {
+  var message = String(body.message || 'unknown error').slice(0, 2000);
+  if (holdsLease(props, body)) props.deleteProperty('RUN_LEASE');
+  try {
+    new Dashboard().sheet('Log', ['Time (IST)', 'Level', 'Message']).appendRow([ist(now), 'alert', 'The run failed: ' + message.slice(0, 500)]);
+  } catch (e) {
+    console.log('Could not log the failed run: ' + e);
+  }
+  reportCrash(message);
+  return {ok: true};
+}
+
+function bridgeConfig(props, body) {
+  var set = [];
+  ['GITHUB_TOKEN', 'OWNER_EMAIL'].forEach(function (key) {
+    if (!(key in body)) return;
+    var value = String(body[key] || '').trim();
+    if (value) props.setProperty(key, value); else props.deleteProperty(key);
+    set.push(key);
+  });
+  return {ok: true, set: set};
+}
+
+function bridgeStatus(props, now) {
+  var state = loadState(props), book = state && state.book;
+  return {ok: true, version: CODE_VERSION, now: now, lastOkAt: Number(props.getProperty('LAST_OK_AT') || 0) || null,
+          lease: readLease(props), dispatchError: props.getProperty('DISPATCH_ERROR'),
+          triggers: ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); }),
+          hasKeys: !!readKeys(props), hasGithubToken: !!props.getProperty('GITHUB_TOKEN'), hasOwnerEmail: !!props.getProperty('OWNER_EMAIL'),
+          mode: new Dashboard().mode(), runs: state ? state.runs : 0, errors: state ? state.errors : null,
+          book: book ? {kind: book.kind, value: book.lastValue, cash: book.cash, coins: Object.keys(book.positions), halted: !!book.halted} : null};
 }
 
 // ---------------------------------------------------------------- one run
@@ -1301,13 +1525,12 @@ function sendMail(run) {
     var lines = urgent.map(function (e) { return e.message; });
     liveTrades.forEach(function (tr) { lines.push(tradeText(tr)); });
     lines.push('', 'Value if sold now: ' + rupees(state.book.lastValue), sheetUrl());
-    MailApp.sendEmail(CONFIG.email, 'CoinDCX trader: ' + (urgent.length ? urgent[0].message.slice(0, 70) : liveTrades.length + ' trade(s)'),
-                      lines.join('\n'));
+    mailOwner('CoinDCX trader: ' + (urgent.length ? urgent[0].message.slice(0, 70) : liveTrades.length + ' trade(s)'), lines.join('\n'));
   }
   var local = new Date(now + IST_MS), date = local.toISOString().slice(0, 10);
   if (local.getUTCHours() >= CONFIG.reportHourIst && mail.dailyDate !== date) {
     mail.dailyDate = date;
-    MailApp.sendEmail(CONFIG.email, 'CoinDCX trader daily report, ' + date, reportText(state, run.ticker || {}, now));
+    mailOwner('CoinDCX trader daily report, ' + date, reportText(state, run.ticker || {}, now));
   }
 }
 

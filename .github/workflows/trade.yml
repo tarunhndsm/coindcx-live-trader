@@ -1,0 +1,38 @@
+name: trade
+
+# Started every 15 minutes by the Apps Script project (tick), and hourly here in case that stops.
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Run even if a run finished in the last 10 minutes
+        type: boolean
+        default: false
+  schedule:
+    - cron: '41 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trade
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run the trader once
+        run: node runner/run.mjs
+        env:
+          WEBAPP_URL: ${{ secrets.WEBAPP_URL }}
+          WEBAPP_SECRET: ${{ secrets.WEBAPP_SECRET }}
+          FORCE: ${{ inputs.force }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}

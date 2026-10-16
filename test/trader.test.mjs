@@ -1,17 +1,12 @@
+// The trading scenarios. Each runs the production way: a GitHub runner between the fake CoinDCX and Apps Script.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
-import {FakeExchange, MARKETS} from './exchange.mjs';
-import {Clock, Properties, loadTrader} from './gas.mjs';
+import {Clock, HOUR, OWNER, RUN, START, agrees, candles, loadTrader, world} from './world.mjs';
 
 const read = (name) => JSON.parse(fs.readFileSync(new URL('./fixtures/' + name, import.meta.url), 'utf8'));
-const candles = read('candles.json');
 const signals = read('signals.json');
 const windows = read('windows.json');
-const HOUR = 3600000, DAY = 24 * HOUR, RUN = 15 * 60000;
-const START = Date.UTC(2026, 3, 28, 23, 50);  // 29 Apr 2026 05:20 IST, when all four rules wanted coins
-const COINS = Object.values(MARKETS).map((m) => m.coin);
-const STEP = Object.fromEntries(Object.values(MARKETS).map((m) => [m.coin, m.step]));
 
 function withHistories(t) {
   t.ctx.__candles = candles;
@@ -24,61 +19,6 @@ function withHistories(t) {
 
 function offline() {
   return loadTrader({handler: () => { throw new Error('offline'); }, clock: new Clock(START)});
-}
-
-function world({keys = true, start = START, ...options} = {}) {
-  const clock = new Clock(start);
-  const ex = new FakeExchange({clock, candles, ...options});
-  const props = new Properties();
-  if (keys) {
-    props.setProperty('COINDCX_API_KEY', ex.key);
-    props.setProperty('COINDCX_API_SECRET', keys === 'wrong' ? 'not-the-secret' : ex.secret);
-  }
-  const t = loadTrader({handler: (url, params) => ex.handle(url, params), clock, props});
-  let runs = 0;
-  const w = {
-    t, ex, clock, props, mails: t.mails,
-    setup() { runs = 1; t.evaluate('setup()'); },
-    run(n = 1, check) {
-      for (let i = 0; i < n; i++) {
-        clock.now = Math.max(clock.now + 1000, start + runs++ * RUN);
-        t.evaluate('runTrader()');
-        if (check) check(w);
-      }
-    },
-    state() { return JSON.parse(t.evaluate('JSON.stringify(loadState(PropertiesService.getScriptProperties()))')); },
-    mode(value) {
-      const control = t.spreadsheet.getSheetByName('Control');
-      if (value !== undefined) control.getRange('B3').setValue(value);
-      return control.getRange('B3').getValue();
-    },
-    rows(name, width) {
-      const sheet = t.spreadsheet.getSheetByName(name);
-      return Array.from({length: sheet.getLastRow() - 1}, (_, i) => sheet.rowValues(i + 2, width));
-    },
-    control() {
-      const sheet = t.spreadsheet.getSheetByName('Control');
-      return Object.fromEntries(Array.from({length: 40}, (_, i) => sheet.rowValues(i + 6, 2)).filter((r) => r[0]));
-    },
-    logText() { return w.rows('Log', 3).map((r) => r.join(' | ')).join('\n'); }
-  };
-  return w;
-}
-
-/** The bot's own figures must agree with the exchange: it owns `reserve` less of the INR than CoinDCX holds. */
-function agrees(reserve) {
-  return (w) => {
-    const book = w.state().book;
-    if (book.kind !== 'live') return;
-    if (!book.pending.length) assert.equal(w.ex.openOrders().length, 0, 'an order was left open\n' + w.logText());
-    for (const coin of COINS) {
-      const pos = book.positions['I-' + coin + '_INR'];
-      const diff = w.ex.total(coin) - (pos ? pos.qty : 0);
-      assert.ok(diff > -1e-9 && diff < STEP[coin], coin + ': exchange ' + w.ex.total(coin) + ', bot ' + (pos && pos.qty) + '\n' + w.logText());
-    }
-    assert.ok(Math.abs(w.ex.total('INR') - reserve - book.cash) < 0.5,
-              'INR: exchange ' + w.ex.total('INR') + ', bot cash ' + book.cash + '\n' + w.logText());
-  };
 }
 
 const buys = (ex) => ex.orders.filter((o) => o.side === 'buy');
@@ -145,7 +85,7 @@ test('without a key it paper trades for two weeks and never calls the private AP
   assert.ok(s.book.trades + Object.keys(s.book.positions).length > 0, 'the paper book followed the rules');
   const reports = w.mails.filter((m) => m.subject.startsWith('CoinDCX trader daily report'));
   assert.ok(reports.length >= 14 && reports.length <= 15, 'one report a day, got ' + reports.length);
-  assert.ok(w.mails.every((m) => m.to === 't.a.bhagat@gmail.com'));
+  assert.ok(w.mails.every((m) => m.to === OWNER));
   assert.ok(!w.mails.some((m) => /error|failed|Unexpected/i.test(m.subject + m.body)), w.mails.map((m) => m.subject).join('\n'));
   assert.ok(w.rows('Trades', 13).every((r) => r[1] === 'Paper'));
   const valueRows = w.rows('Value', 9).length;
@@ -351,8 +291,10 @@ test('a crashed run emails once and then waits six hours before emailing again',
   w.t.evaluate('prepareSheets()');
   w.props.setProperty('STATE_PARTS', '1');
   w.props.setProperty('STATE_0', '{not json');
-  assert.throws(() => w.t.evaluate('runTrader()'));
+  assert.throws(() => w.step());
   w.clock.advance(RUN);
-  assert.throws(() => w.t.evaluate('runTrader()'));
+  assert.throws(() => w.step());
   assert.equal(w.mails.filter((m) => /a run failed/.test(m.subject)).length, 1);
+  assert.match(w.logText(), /The run failed: SyntaxError/);
+  assert.equal(w.props.getProperty('RUN_LEASE'), null, 'a failed run gives up its lease');
 });

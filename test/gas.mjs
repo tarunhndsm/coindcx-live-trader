@@ -87,11 +87,32 @@ export class Properties {
   getProperties() { return Object.fromEntries(this.map); }
 }
 
+class Cache {
+  constructor(clock) { this.clock = clock; this.map = new Map(); }
+  get(key) {
+    const entry = this.map.get(key);
+    return entry && entry.until > this.clock.now ? entry.value : null;
+  }
+  put(key, value, seconds) { this.map.set(key, {value, until: this.clock.now + seconds * 1000}); }
+}
+
+/** Answers SpreadsheetApp.getUi() prompts from `ui.answers` in order, and records alerts in `ui.alerts`. */
+class Ui {
+  constructor() { this.answers = []; this.alerts = []; this.ButtonSet = {OK_CANCEL: 'OK_CANCEL'}; this.Button = {OK: 'OK', CANCEL: 'CANCEL'}; }
+  prompt() {
+    const answer = this.answers.shift();
+    return {getSelectedButton: () => (answer === null || answer === undefined ? 'CANCEL' : 'OK'), getResponseText: () => answer || ''};
+  }
+  alert(message) { this.alerts.push(message); }
+  createMenu() { return {addItem() { return this; }, addSeparator() { return this; }, addToUi() {}}; }
+}
+
 /** Loads Code.gs into a fresh context. `handler(url, params)` answers UrlFetchApp calls with {code, body}. */
 export function loadTrader({handler, clock, props = new Properties(), spreadsheet = new Spreadsheet()} = {}) {
   const mails = [];
   const triggers = [];
   const calls = [];
+  const ui = new Ui();
   const ctx = vm.createContext({
     console: {log() {}},
     UrlFetchApp: {
@@ -109,21 +130,35 @@ export function loadTrader({handler, clock, props = new Properties(), spreadshee
     },
     PropertiesService: {getScriptProperties: () => props},
     LockService: {getScriptLock: () => ({tryLock: () => true, releaseLock() {}})},
+    CacheService: {getScriptCache: () => cache},
+    ContentService: {
+      createTextOutput: (text) => ({getContent: () => text, setMimeType() { return this; }}),
+      MimeType: {JSON: 'JSON'}
+    },
     SpreadsheetApp: {
       getActiveSpreadsheet: () => spreadsheet,
+      getUi: () => ui,
       newDataValidation: () => ({requireValueInList() { return this; }, build() { return {list: true}; }}),
       flush() {}
     },
     MailApp: {sendEmail(to, subject, body) { mails.push({to, subject, body, at: clock.now}); }},
     ScriptApp: {
-      getProjectTriggers: () => triggers.map((t) => ({getHandlerFunction: () => t.fn})),
-      deleteTrigger() { triggers.length = 0; },
+      getProjectTriggers: () => triggers.map((t) => ({getHandlerFunction: () => t.fn, fn: t.fn})),
+      deleteTrigger(trigger) { triggers.splice(triggers.findIndex((t) => t.fn === trigger.fn), 1); },
       newTrigger: (fn) => ({timeBased: () => ({everyMinutes: (m) => ({create: () => triggers.push({fn, m})})})})
     },
     __clock: clock
   });
+  const cache = new Cache(clock);
   vm.runInContext(fs.readFileSync(SOURCE, 'utf8'), ctx, {filename: 'Code.gs'});
   vm.runInContext('nowMs = function () { return __clock.now; };', ctx);
   const evaluate = (code) => vm.runInContext(code, ctx);
-  return {ctx, evaluate, props, spreadsheet, mails, triggers, calls, clock};
+  /** Calls doPost the way the web app would, returning the reply text. */
+  const post = (text) => {
+    ctx.__post = {postData: {contents: text, type: 'text/plain'}};
+    return vm.runInContext('doPost(__post)', ctx).getContent();
+  };
+  return {ctx, evaluate, post, props, spreadsheet, mails, triggers, calls, clock, ui};
 }
+
+export const SOURCE_PATH = SOURCE;
