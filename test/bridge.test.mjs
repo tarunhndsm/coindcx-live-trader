@@ -203,6 +203,9 @@ test('an HTML page from CoinDCX, such as a firewall block, is reported by its ti
   assert.match(w.control()['Last problem'], /IST: prices: ticker: HTTP 403 and not JSON: HTML page "Attention Required! \| Cloudflare"$/);
   assert.equal(w.t.evaluate('briefBody("<html>Internal Server Error</html>")'), 'HTML page "Internal Server Error"');
   assert.equal(w.t.evaluate('briefBody(\'{"message":"Bad credentials"}\')'), '{"message":"Bad credentials"}');
+  const saved = 'prices: ticker: HTTP 403 and not JSON: <!DOCTYPE html>\n<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->\n' +
+                '<!--[if IE 7]>    <html class="no-js ie7 oldie" lang="en-US"> <![endif]-->\n<!--[if IE 8]>    <html class="no-';
+  assert.equal(w.t.evaluate('readableProblem(' + JSON.stringify(saved) + ')'), 'prices: ticker: HTTP 403 and not JSON: an HTML page');
 });
 
 test('saving a CoinDCX key from the menu starts a run, which starts live trading', () => {

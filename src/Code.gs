@@ -15,7 +15,7 @@
  * @OnlyCurrentDoc
  */
 
-var CODE_VERSION = '2026-10-17.2';
+var CODE_VERSION = '2026-10-17.3';
 
 var CONFIG = {
   capitalInr: 5000,
@@ -632,8 +632,14 @@ function briefBody(body) {
   var text = String(body || '');
   if (!/^\s*</.test(text)) return text.slice(0, 200);
   var title = (text.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1];
-  var words = title || text.replace(/<!--[\s\S]*?-->|<(script|style)[\s\S]*?<\/\1>|<[^>]*>/gi, ' ');
-  return 'HTML page "' + words.replace(/\s+/g, ' ').trim().slice(0, 120) + '"';
+  var words = (title || text.replace(/<!--[\s\S]*?(-->|$)|<(script|style)[\s\S]*?(<\/\2>|$)|<[^>]*(>|$)/gi, ' ')).replace(/\s+/g, ' ').trim();
+  return words ? 'HTML page "' + words.slice(0, 120) + '"' : 'an HTML page';
+}
+
+/** Problems saved by older versions can end in a raw, cut-off HTML page. */
+function readableProblem(message) {
+  var at = message.search(/<!doctype|<html/i);
+  return at < 0 ? message : message.slice(0, at) + briefBody(message.slice(at));
 }
 
 function privateCall(keys, path, body, retries) {
@@ -1535,7 +1541,7 @@ function statusRows(run) {
     ['Trades', book.trades + ' sales, ' + book.wins + ' at a profit'],
     ['Last trade', book.lastTradeAt ? ist(book.lastTradeAt) : 'none yet'],
     ['Next rule check', 'daily at 05:30 IST; relative momentum on Mondays'],
-    ['Last problem', state.errors.lastMessage ? ist(state.errors.lastAt) + ': ' + state.errors.lastMessage : 'none']
+    ['Last problem', state.errors.lastMessage ? ist(state.errors.lastAt) + ': ' + readableProblem(state.errors.lastMessage) : 'none']
   ];
   if (run.waiting) rows.splice(1, 0, ['Waiting', run.waiting]);
   if (run.keyProblem) rows.splice(1, 0, ['API key problem', run.keyProblem]);
@@ -1604,7 +1610,7 @@ function reportText(state, ticker, now) {
     lines.push('- ' + CONFIG.ruleLabels[rule] + ': ' + rupees(value) + ' (' + signedPct(value / sleeve.acct.capital - 1) + '), weight ' +
                pct(state.weights[rule], 0) + ', ' + holdingText(sleeve.acct.positions) + (sleeve.halted ? ', stopped by its brake' : ''));
   });
-  lines.push('', 'Problems: ' + (state.errors.lastMessage ? ist(state.errors.lastAt) + ' ' + state.errors.lastMessage : 'none') + '.',
+  lines.push('', 'Problems: ' + (state.errors.lastMessage ? ist(state.errors.lastAt) + ' ' + readableProblem(state.errors.lastMessage) : 'none') + '.',
              'Dashboard and controls: ' + sheetUrl(),
              '', 'These rules lost a little after costs in testing; a profit is not guaranteed.');
   return lines.join('\n');
