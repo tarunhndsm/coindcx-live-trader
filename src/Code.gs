@@ -15,7 +15,7 @@
  * @OnlyCurrentDoc
  */
 
-var CODE_VERSION = '2026-10-17.1';
+var CODE_VERSION = '2026-10-17.2';
 
 var CONFIG = {
   capitalInr: 5000,
@@ -237,13 +237,17 @@ function dispatchRun(props, force) {
   } else {
     try {
       var payload = {ref: 'main', inputs: {force: force ? 'true' : 'false'}};
-      var response = workflowCall(token, 'post', '/dispatches', payload);
-      if (response.getResponseCode() !== 204 && enableWorkflow(props, token)) response = workflowCall(token, 'post', '/dispatches', payload);
+      var response = workflowCall(token, 'post', '/dispatches', payload), enableProblem = '';
+      if (response.getResponseCode() !== 204) {
+        enableProblem = enableWorkflow(props, token);
+        if (!enableProblem) response = workflowCall(token, 'post', '/dispatches', payload);
+      }
       if (response.getResponseCode() === 204) {
         if (props.getProperty('DISPATCH_ERROR')) props.deleteProperty('DISPATCH_ERROR');
         return true;
       }
-      problem = 'GitHub answered HTTP ' + response.getResponseCode() + ' ' + briefBody(response.getContentText()).slice(0, 150);
+      problem = 'GitHub answered HTTP ' + response.getResponseCode() + ' ' + briefBody(response.getContentText()).slice(0, 150) +
+                (enableProblem ? '; ' + enableProblem : '');
     } catch (e) {
       problem = String(e && e.message || e).slice(0, 200);
     }
@@ -256,18 +260,26 @@ function dispatchRun(props, force) {
 function keepWorkflowEnabled(props, now) {
   var token = props.getProperty('GITHUB_TOKEN');
   if (!token || now - Number(props.getProperty('WORKFLOW_ENABLED_AT') || 0) < DAY_MS) return;
+  var problem;
   try {
-    enableWorkflow(props, token);
+    problem = enableWorkflow(props, token);
   } catch (e) {
-    console.log('Could not enable the workflow: ' + e);
+    problem = String(e && e.message || e);
   }
+  if (problem) console.log('Could not enable the workflow: ' + problem);
 }
 
-/** GitHub disables a workflow that has a schedule after 60 days without commits, and then refuses to start it. */
+/**
+ * GitHub disables a workflow that has a schedule after 60 days without commits, and then refuses to start it.
+ * Returns '' once the workflow is enabled, otherwise what went wrong.
+ */
 function enableWorkflow(props, token) {
-  var enabled = workflowCall(token, 'put', '/enable').getResponseCode() === 204;
-  if (enabled) props.setProperty('WORKFLOW_ENABLED_AT', String(nowMs()));
-  return enabled;
+  var response = workflowCall(token, 'put', '/enable');
+  if (response.getResponseCode() !== 204) {
+    return 'enabling the workflow answered HTTP ' + response.getResponseCode() + ' ' + briefBody(response.getContentText()).slice(0, 100);
+  }
+  props.setProperty('WORKFLOW_ENABLED_AT', String(nowMs()));
+  return '';
 }
 
 function workflowCall(token, method, path, payload) {

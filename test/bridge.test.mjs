@@ -164,6 +164,7 @@ test('tick starts a GitHub run unless one is going, and the watchdog emails once
   assert.equal(alerts.length, 1);
   assert.match(alerts[0].body, /GitHub answered HTTP 401/);
   assert.match(w.health(), /^PROBLEM: last run finished .*HTTP 401/);
+  assert.match(w.props.getProperty('DISPATCH_ERROR'), /HTTP 401 .*; enabling the workflow answered HTTP 401 /);
   w.githubCode = 204;
   w.t.evaluate('tick()');
   assert.equal(w.props.getProperty('DISPATCH_ERROR'), null);
