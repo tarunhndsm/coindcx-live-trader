@@ -171,6 +171,39 @@ test('tick starts a GitHub run unless one is going, and the watchdog emails once
   assert.match(w.health(), /^OK, last run finished/);
 });
 
+test('the workflow is enabled again daily, and at once when GitHub refuses to start it because it is disabled', () => {
+  const w = world({keys: false});
+  w.t.evaluate('setup()');
+  assert.deepEqual(w.enables, [{method: 'put', payload: undefined}]);
+  for (let i = 1; i < 96; i++) {
+    w.clock.advance(RUN);
+    w.t.evaluate('tick()');
+  }
+  assert.equal(w.enables.length, 1, 'at most once a day');
+  w.clock.advance(RUN);
+  w.t.evaluate('tick()');
+  assert.equal(w.enables.length, 2);
+  w.workflowDisabled = true;
+  const tried = w.dispatches.length;
+  w.clock.advance(RUN);
+  w.t.evaluate('tick()');
+  assert.equal(w.dispatches.length, tried + 2, 'refused once, then started');
+  assert.equal(w.workflowDisabled, false);
+  assert.equal(w.props.getProperty('DISPATCH_ERROR'), null);
+  w.step();
+  assert.match(w.health(), /^OK, last run finished/);
+});
+
+test('an HTML page from CoinDCX, such as a firewall block, is reported by its title', () => {
+  const w = world({keys: false});
+  w.setup();
+  w.ex.inject('/exchange/ticker', 'blocked');
+  w.run();
+  assert.match(w.control()['Last problem'], /IST: prices: ticker: HTTP 403 and not JSON: HTML page "Attention Required! \| Cloudflare"$/);
+  assert.equal(w.t.evaluate('briefBody("<html>Internal Server Error</html>")'), 'HTML page "Internal Server Error"');
+  assert.equal(w.t.evaluate('briefBody(\'{"message":"Bad credentials"}\')'), '{"message":"Bad credentials"}');
+});
+
 test('saving a CoinDCX key from the menu starts a run, which starts live trading', () => {
   const key = 'k'.repeat(32), secret = 's'.repeat(40);
   const w = world({keys: false, balances: {INR: 5000}, key, secret});

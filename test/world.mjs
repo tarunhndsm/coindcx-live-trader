@@ -14,7 +14,9 @@ export const START = Date.UTC(2026, 3, 28, 23, 50);  // 29 Apr 2026 05:20 IST, w
 export const OWNER = 'owner@example.com';
 export const SECRET = 'c0ffee'.repeat(10) + 'beef';
 export const WEBAPP_URL = 'https://script.google.com/macros/s/test-deployment/exec';
-export const DISPATCH_URL = 'https://api.github.com/repos/tarunhndsm/coindcx-live-trader/actions/workflows/trade.yml/dispatches';
+const WORKFLOW_URL = 'https://api.github.com/repos/tarunhndsm/coindcx-live-trader/actions/workflows/trade.yml';
+export const DISPATCH_URL = WORKFLOW_URL + '/dispatches';
+export const ENABLE_URL = WORKFLOW_URL + '/enable';
 const COINS = Object.values(MARKETS).map((m) => m.coin);
 const STEP = Object.fromEntries(Object.values(MARKETS).map((m) => [m.coin, m.step]));
 
@@ -31,11 +33,19 @@ export function world({keys = true, start = START, via = 'github', ...options} =
     props.setProperty('COINDCX_API_KEY', ex.key);
     props.setProperty('COINDCX_API_SECRET', keys === 'wrong' ? 'not-the-secret' : ex.secret);
   }
-  const dispatches = [];
+  const dispatches = [], enables = [];
+  const refused = () => w.githubCode === 204 ? null : {code: w.githubCode, body: '{"message":"Bad credentials"}'};
   const appsScriptFetch = (url, params) => {
     if (url === DISPATCH_URL) {
       dispatches.push({url, params: JSON.parse(JSON.stringify(params))});
-      return {code: w.githubCode, body: w.githubCode === 204 ? '' : '{"message":"Bad credentials"}'};
+      if (w.workflowDisabled && !refused()) return {code: 422, body: '{"message":"Cannot trigger a \'workflow_dispatch\' on a disabled workflow"}'};
+      return refused() || {code: 204, body: ''};
+    }
+    if (url === ENABLE_URL) {
+      enables.push({method: params.method, payload: params.payload});
+      if (refused()) return refused();
+      w.workflowDisabled = false;
+      return {code: 204, body: ''};
     }
     if (via === 'github') throw new Error('Apps Script must not call ' + url);
     return ex.handle(url, params);
@@ -51,7 +61,7 @@ export function world({keys = true, start = START, via = 'github', ...options} =
   const call = webApp({url: WEBAPP_URL, secret: SECRET, http, now: () => clock.now, sleep});
   let runs = 0, ids = 0;
   const w = {
-    t, ex, clock, props, mails: t.mails, dispatches, outside, call, http, githubCode: 204,
+    t, ex, clock, props, mails: t.mails, dispatches, enables, outside, call, http, githubCode: 204, workflowDisabled: false,
     runner({runId = 'run-' + ++ids, force = false, source = SOURCE, callWith = call} = {}) {
       return runOnce({source, call: callWith, http, runId, force, now: () => clock.now, sleep});
     },

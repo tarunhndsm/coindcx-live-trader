@@ -11,6 +11,9 @@ export const MARKETS = {
 const BY_PAIR = Object.fromEntries(Object.entries(MARKETS).map(([symbol, m]) => [m.pair, {symbol, ...m}]));
 
 const json = (code, data) => ({code, body: JSON.stringify(data)});
+const BLOCK_PAGE = '<!DOCTYPE html>\n<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->\n' +
+  '<html><head><title>Attention Required! | Cloudflare</title><style>body { color: #404040 }</style></head>\n' +
+  '<body><h1>Sorry, you have been blocked</h1><p>Cloudflare Ray ID: 8f2a1b3c4d5e6f70</p></body></html>';
 const hasDecimals = (x, d) => Math.abs(x * 10 ** d - Math.round(x * 10 ** d)) < 1e-6;
 
 export class FakeExchange {
@@ -29,7 +32,10 @@ export class FakeExchange {
     this.cache = new Map();
   }
 
-  /** The next `times` matching calls fail: 'http500' and 'network' do nothing, 'lostReply' acts and then loses the reply. */
+  /**
+   * The next `times` matching calls fail: 'http500', 'http429', 'network' and 'blocked' (a firewall page) do nothing,
+   * 'lostReply' acts and then loses the reply.
+   */
   inject(path, kind, times = 1) { this.failures.push({path, kind, times}); }
 
   lastClosed(pair) {
@@ -53,6 +59,7 @@ export class FakeExchange {
       if (failure.kind === 'http500') return {code: 500, body: '<html>Internal Server Error</html>'};
       if (failure.kind === 'network') throw new Error('Address unavailable: ' + url);
       if (failure.kind === 'http429') return json(429, {message: 'Too many requests'});
+      if (failure.kind === 'blocked') return {code: 403, body: BLOCK_PAGE};
     }
     const reply = this.route(u, params);
     if (failure && failure.kind === 'lostReply') throw new Error('Timeout: ' + url);

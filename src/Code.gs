@@ -103,6 +103,7 @@ function setup() {
 function tick() {
   var props = PropertiesService.getScriptProperties(), now = nowMs(), lease = readLease(props);
   if (!lease || lease.until <= now) dispatchRun(props, false);
+  keepWorkflowEnabled(props, now);
   watchdog(props, now);
 }
 
@@ -235,22 +236,48 @@ function dispatchRun(props, force) {
     problem = 'no GITHUB_TOKEN script property';
   } else {
     try {
-      var response = UrlFetchApp.fetch('https://api.github.com/repos/' + CONFIG.repo + '/actions/workflows/' + CONFIG.workflow + '/dispatches', {
-        method: 'post', contentType: 'application/json', muteHttpExceptions: true,
-        headers: {Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'},
-        payload: JSON.stringify({ref: 'main', inputs: {force: force ? 'true' : 'false'}})
-      });
+      var payload = {ref: 'main', inputs: {force: force ? 'true' : 'false'}};
+      var response = workflowCall(token, 'post', '/dispatches', payload);
+      if (response.getResponseCode() !== 204 && enableWorkflow(props, token)) response = workflowCall(token, 'post', '/dispatches', payload);
       if (response.getResponseCode() === 204) {
         if (props.getProperty('DISPATCH_ERROR')) props.deleteProperty('DISPATCH_ERROR');
         return true;
       }
-      problem = 'GitHub answered HTTP ' + response.getResponseCode() + ' ' + response.getContentText().slice(0, 150);
+      problem = 'GitHub answered HTTP ' + response.getResponseCode() + ' ' + briefBody(response.getContentText()).slice(0, 150);
     } catch (e) {
       problem = String(e && e.message || e).slice(0, 200);
     }
   }
   props.setProperty('DISPATCH_ERROR', ist(nowMs()) + ': ' + problem);
   return false;
+}
+
+/** Once a day, so that GitHub's hourly fallback schedule stays on as well. */
+function keepWorkflowEnabled(props, now) {
+  var token = props.getProperty('GITHUB_TOKEN');
+  if (!token || now - Number(props.getProperty('WORKFLOW_ENABLED_AT') || 0) < DAY_MS) return;
+  try {
+    enableWorkflow(props, token);
+  } catch (e) {
+    console.log('Could not enable the workflow: ' + e);
+  }
+}
+
+/** GitHub disables a workflow that has a schedule after 60 days without commits, and then refuses to start it. */
+function enableWorkflow(props, token) {
+  var enabled = workflowCall(token, 'put', '/enable').getResponseCode() === 204;
+  if (enabled) props.setProperty('WORKFLOW_ENABLED_AT', String(nowMs()));
+  return enabled;
+}
+
+function workflowCall(token, method, path, payload) {
+  var options = {method: method, muteHttpExceptions: true,
+                 headers: {Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}};
+  if (payload) {
+    options.contentType = 'application/json';
+    options.payload = JSON.stringify(payload);
+  }
+  return UrlFetchApp.fetch('https://api.github.com/repos/' + CONFIG.repo + '/actions/workflows/' + CONFIG.workflow + path, options);
 }
 
 function watchdog(props, now) {
@@ -571,14 +598,14 @@ function request(url, options, what, retries) {
     }
     var code = response.getResponseCode(), body = response.getContentText();
     if (code === 429 || code >= 500) {
-      lastError = new ApiError(what + ': HTTP ' + code + ' ' + body.slice(0, 200), code, body);
+      lastError = new ApiError(what + ': HTTP ' + code + ' ' + briefBody(body), code, body);
       continue;
     }
     var data;
     try {
       data = JSON.parse(body);
     } catch (e) {
-      throw new ApiError(what + ': HTTP ' + code + ' and not JSON: ' + body.slice(0, 200), code, body);
+      throw new ApiError(what + ': HTTP ' + code + ' and not JSON: ' + briefBody(body), code, body);
     }
     if (code !== 200) {
       throw new ApiError(what + ': HTTP ' + code + ' ' + (data && data.message ? data.message : body.slice(0, 200)), code, body);
@@ -586,6 +613,15 @@ function request(url, options, what, retries) {
     return data;
   }
   throw lastError;
+}
+
+/** A reply body short enough for a message: an HTML page, such as a firewall's block page, becomes its title. */
+function briefBody(body) {
+  var text = String(body || '');
+  if (!/^\s*</.test(text)) return text.slice(0, 200);
+  var title = (text.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1];
+  var words = title || text.replace(/<!--[\s\S]*?-->|<(script|style)[\s\S]*?<\/\1>|<[^>]*>/gi, ' ');
+  return 'HTML page "' + words.replace(/\s+/g, ' ').trim().slice(0, 120) + '"';
 }
 
 function privateCall(keys, path, body, retries) {
